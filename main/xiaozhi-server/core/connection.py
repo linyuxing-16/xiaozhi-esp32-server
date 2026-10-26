@@ -43,6 +43,8 @@ from config.logger import setup_logging, build_module_string, create_connection_
 from config.manage_api_client import DeviceNotFoundException, DeviceBindException, generate_and_save_chat_title
 from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
+from core.utils.video.session import VideoSession, RoundArtifacts
+from core.utils.video.round import build_video_round, put_round_messages
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
 
@@ -143,6 +145,12 @@ class ConnectionHandler:
         # 为每个连接单独管理声纹识别
         self.voiceprint_provider = None
 
+        # 视频会话（需求 ①-⑥，D1-D15）；配置未开启时是空实现
+        self.video_session = None
+        self.video_round: RoundArtifacts | None = None
+        self.video_asr_result = None
+        self._video_voice_active = False
+
         # vad相关变量
         self.client_audio_buffer = bytearray()
         self.client_have_voice = False
@@ -199,6 +207,58 @@ class ConnectionHandler:
         self.calling = False
         # 标记当前是否为来电接听模式
         self.incoming_call = None
+
+        # 创建视频会话（配置未开启时保持 None）
+        self._init_video_session()
+
+    @staticmethod
+    def _is_placeholder(value) -> bool:
+        """判断配置值是否仍是占位符（"你的xxx" / 空 / none）。"""
+        text = str(value or "").strip()
+        if not text or text.lower() in ("none", "null"):
+            return True
+        return text.startswith("你的") or "placeholder" in text.lower()
+
+    def _apply_video_provider_config(self, video_config: dict):
+        """把 video.provider 的网关信息回填到 LLM.VideoLLM（D3/D7）。
+
+        这样只要在 video.provider 里填一次 base_url/model_name/api_key，
+        selected_module.LLM 设为 VideoLLM 就能直接生效。
+        """
+        provider = video_config.get("provider") or {}
+        base_url = provider.get("base_url")
+        model_name = provider.get("model_name")
+        if self._is_placeholder(base_url) or self._is_placeholder(model_name):
+            return
+        llm_section = self.config.setdefault("LLM", {})
+        video_llm = llm_section.setdefault("VideoLLM", {})
+        video_llm.setdefault("type", "video_url")
+        video_llm["base_url"] = base_url
+        video_llm["model_name"] = model_name
+        if not self._is_placeholder(provider.get("api_key")):
+            video_llm["api_key"] = provider.get("api_key")
+        selected = (self.config.get("selected_module") or {}).get("LLM")
+        if selected != "VideoLLM":
+            self.logger.bind(tag=TAG).warning(
+                f"[video] 已按 video.provider 回填 LLM.VideoLLM，但 selected_module.LLM "
+                f"当前为 {selected}，视频消息不会发给该网关（如需生效请改为 VideoLLM）"
+            )
+
+    def _init_video_session(self):
+        """创建视频会话（配置 video.enable=true 时生效）。"""
+        video_config = self.config.get("video") or {}
+        if not video_config.get("enable", False):
+            return
+        try:
+            self._apply_video_provider_config(video_config)
+            self.video_session = VideoSession(self.config, session_id=self.session_id)
+            self.logger.bind(tag=TAG).info(
+                f"视频会话已初始化（fps={self.video_session.fps}, "
+                f"analyze={self.video_session.analyze}）"
+            )
+        except Exception as e:
+            self.video_session = None
+            self.logger.bind(tag=TAG).error(f"视频会话初始化失败，已降级为纯音频: {e}")
 
     async def handle_connection(self, ws: websockets.ServerConnection):
         try:
@@ -368,6 +428,10 @@ class ConnectionHandler:
         if isinstance(message, str):
             await handleTextMessage(self, message)
         elif isinstance(message, bytes):
+            # 视频帧走独立二进制通道（D11，首字节 type=2），与 opus 音频分流
+            if self.video_session is not None and self.video_session.push_frame_bytes(message):
+                return
+
             if self.vad is None or self.asr is None:
                 return
 
@@ -1063,7 +1127,8 @@ class ConnectionHandler:
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
-            self.dialogue.put(Message(role="user", content=query))
+            # 需求 ④⑤：把本轮视频拼进消息字典（⑤ 在 ④ 之前，索引严格更小）
+            self._put_user_message_with_video(query)
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
@@ -1536,6 +1601,53 @@ class ConnectionHandler:
             # 标记任务完成
             self.report_queue.task_done()
 
+    # ------------------------------------------------------------ 视频轮次
+    def _build_video_round(self) -> RoundArtifacts | None:
+        """把本轮视频渲染 + 分析 + 组装成附件（失败只降级）。"""
+        video_session = getattr(self, "video_session", None)
+        if video_session is None:
+            return None
+        try:
+            started = time.monotonic()
+            artifacts = build_video_round(
+                video_session, getattr(self, "video_asr_result", None)
+            )
+            if artifacts is None:
+                self.video_asr_result = None
+                return None
+            elapsed_ms = (time.monotonic() - started) * 1000
+            self.video_asr_result = None
+            self.video_round = artifacts
+            if elapsed_ms > 1000:
+                self.logger.bind(tag=TAG).warning(
+                    f"[video] 本轮视频准备耗时 {elapsed_ms:.0f}ms（含 ffmpeg 封装与分析），"
+                    f"已影响首字延迟；可调小 video.fps / max_buffer_frames 或关闭 analyze"
+                )
+            else:
+                self.logger.bind(tag=TAG).debug(
+                    f"[video] 本轮视频准备耗时 {elapsed_ms:.0f}ms"
+                )
+            for note in artifacts.notes:
+                self.logger.bind(tag=TAG).warning(f"[video] {note}")
+            if artifacts.has_video:
+                self.logger.bind(tag=TAG).info(
+                    f"[video] 第 {artifacts.round_index} 轮视频已就绪: "
+                    f"用户段={artifacts.user_video} TTS段={artifacts.tts_video}"
+                )
+            return artifacts
+        except Exception as e:
+            self.logger.bind(tag=TAG).error(f"[video] 生成本轮视频失败（不影响对话）: {e}")
+            return None
+
+    def _put_user_message_with_video(self, query):
+        """写用户消息；有视频时拆成两条（⑤ 在前、④ 在后）。
+
+        需求 ⑤ 要求"⑤ 的消息在消息列表中的索引号小于 ④"，因此必须先 put ⑤。
+        两条都是 user 角色（作为模型的多模态上下文），⑤ 的文本带明确标注。
+        """
+        artifacts = self._build_video_round()
+        put_round_messages(self.dialogue, query, artifacts)
+
     def clearSpeakStatus(self):
         self.client_is_speaking = False
         self.logger.bind(tag=TAG).debug(f"清除服务端讲话状态")
@@ -1593,6 +1705,20 @@ class ConnectionHandler:
                     self.logger.bind(tag=TAG).error(
                         f"清理工具处理器时出错: {cleanup_error}"
                     )
+
+            # 需求 ⑥（D5）：会话结束统一删除本会话全部视频
+            if getattr(self, "video_session", None) is not None:
+                try:
+                    removed = self.video_session.close()
+                    self.logger.bind(tag=TAG).info(
+                        f"[video] 会话结束，已清理视频 {len(removed)} 个"
+                    )
+                except Exception as video_error:
+                    self.logger.bind(tag=TAG).error(
+                        f"[video] 清理会话视频失败: {video_error}"
+                    )
+                finally:
+                    self.video_session = None
 
             # 触发停止事件
             if self.stop_event:

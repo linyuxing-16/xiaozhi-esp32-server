@@ -13,6 +13,7 @@ class Message:
             tool_calls=None,
             tool_call_id=None,
             is_temporary=False,
+            attachments: list = None,
     ):
         self.uniq_id = uniq_id if uniq_id is not None else str(uuid.uuid4())
         self.role = role
@@ -20,6 +21,9 @@ class Message:
         self.tool_calls = tool_calls
         self.tool_call_id = tool_call_id
         self.is_temporary = is_temporary  # 标记临时消息（如工具调用提醒）
+        # 多模态附件（需求 ④⑤）：形如
+        # {"type": "video", "kind": "user"|"tts", "path": "...", "analysis": {...}}
+        self.attachments = attachments or []
 
 
 class Dialogue:
@@ -42,6 +46,16 @@ class Dialogue:
                         str(uuid.uuid4()) if m.tool_call_id is None else m.tool_call_id
                     ),
                     "content": m.content,
+                }
+            )
+        elif getattr(m, "attachments", None):
+            # 需求 ④⑤：有视频附件时输出 OpenAI 兼容的 content 数组
+            from core.utils.video.multimodal import build_content_blocks
+
+            dialogue.append(
+                {
+                    "role": m.role,
+                    "content": build_content_blocks(m.content or "", m.attachments),
                 }
             )
         else:

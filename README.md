@@ -227,6 +227,7 @@ Websocket接口地址: wss://2662r3426b.vicp.fun/xiaozhi/v1/
 | 声纹识别 | 支持多用户声纹注册、管理和识别，与ASR并行处理，实时识别说话人身份并传递给LLM进行个性化回应 |
 | 智能对话 | 支持多种LLM(大语言模型)，实现智能对话 |
 | 视觉感知 | 支持多种VLLM(视觉大模型)，实现多模态交互 |
+| 视频理解 | [视频管线](docs/video-pipeline.md)：设备上行视频（type=2 二进制通道）→ 自动录制并在说话起止对齐音画 → YOLO+跟踪+人脸识别+说话人判定 → 视频与 ASR 文本拼成一条多模态消息交给 LLM；会话结束统一清理（需求 ①-⑥） |
 | 意图识别 | 支持外挂的大模型意图识别、大模型自主函数调用，提供插件化意图处理机制 |
 | 记忆系统 | 支持本地短期记忆、mem0ai接口记忆、PowerMem智能记忆，具备记忆总结功能 |
 | 知识库 | 支持RAGFlow知识库，让大模型判断需要调度知识库后再回答 |
@@ -277,6 +278,17 @@ Websocket接口地址: wss://2662r3426b.vicp.fun/xiaozhi/v1/
 
 ---
 
+### 视频理解（VideoLLM）
+
+| 使用方式 | 说明 | 配置项 |
+|:---:|:---|:---|
+| openai 兼容网关（`video_url` 内容块） | 视频以 base64 内联放入 `video_url`，不设体积上限、不截断（D3/D14） | `LLM.VideoLLM` 或 `video.provider` |
+| MockVideoLLM | 记录 messages 原文并返回预定回复，供自动化验收 | `LLM.MockVideoLLM` |
+
+接入方式与验证步骤见 [视频管线文档](docs/video-pipeline.md)。
+
+---
+
 ### TTS 语音合成
 
 | 使用方式 | 支持平台 | 免费平台 |
@@ -300,6 +312,7 @@ Websocket接口地址: wss://2662r3426b.vicp.fun/xiaozhi/v1/
 |:---:|:---:|:---:|
 | 本地使用 | FunASR、SherpaASR | FunASR、SherpaASR |
 | 接口调用 | FunASRServer、火山引擎、科大讯飞、腾讯云、阿里云、百度云、OpenAI ASR | FunASRServer |
+| 测试用 | MockASR（返回带句级时间戳与声纹 id 的预定句子，供三轮验收） | MockASR |
 
 ---
 

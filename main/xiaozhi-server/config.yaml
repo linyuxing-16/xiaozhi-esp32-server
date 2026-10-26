@@ -392,6 +392,23 @@ ASR:
     model_dir: models/sherpa-onnx-paraformer-zh-small-2024-03-09
     output_dir: tmp/
     model_type: paraformer
+  MockASR:
+    # 测试用 ASR（阶段 H）：返回带句级时间戳 + 声纹 id 的预定句子，不发网络请求
+    # supports_sentence_timestamp=True -> ③ 的 time_source 为 asr
+    type: mock_asr
+    output_dir: tmp/
+    replies:
+      - content: "你好，今天天气怎么样。我想出去走走。"
+        sentences:
+          - text: "你好，今天天气怎么样"
+            start: 1200
+            end: 4300
+            voiceprint_id: "spk_a1b2"
+          - text: "我想出去走走"
+            start: 5100
+            end: 7800
+            voiceprint_id: "spk_a1b2"
+        speaker: "spk_a1b2"
   DoubaoASR:
     # 可以在这里申请相关Key等信息
     # https://console.volcengine.com/speech/app
@@ -742,6 +759,25 @@ LLM:
     # Xinference服务地址和模型名称
     model_name: qwen2.5:3b-AWQ  # 使用的小模型名称，用于意图识别
     base_url: http://localhost:9997  # Xinference服务地址
+
+  # ===== 需求 ④（D3/D7）：支持视频的 OpenAI 兼容网关 =====
+  # 把视频原样作为 video_url 内容块（base64 内联）发给供应商。
+  # 不设体积上限、不截断、不降码率（D14）。
+  VideoLLM:
+    type: video_url
+    # 网关地址，例如 https://your-gateway/v1（必须兼容 OpenAI Chat Completions）
+    base_url: 你的视频网关地址
+    # 支持视频的模型名，例如 qwen-vl-max / gemini-2.0-flash / 自建模型
+    model_name: 你的视频模型名
+    api_key: 你的视频网关密钥
+    # 以下可不填，默认继承上面的 base_url / model_name / api_key
+    # video_base_url: https://your-gateway/v1
+    # video_model_name: 你的视频模型名
+    # video_api_key: 你的视频网关密钥
+  # 测试用提供商（阶段 H）：记录 messages 原文、返回预定回复，不发任何网络请求
+  MockVideoLLM:
+    type: MockVideoLLM
+    reply: "我看到了，你的画面我收到了。"
 # VLLM配置（视觉语言大模型）
 VLLM:
   ChatGLMVLLM:
@@ -1173,3 +1209,78 @@ TTS:
     # speed: 50  # 语速：0-100
     # pitch: 50  # 语调：0-100
     # language: "中文"  # 指定输出语种,如:中文、英语、日语、韩语等,请根据所选音色支持的语言进行设置,不填则默认为中文
+
+# #####################################################################################
+# ################################## 视频能力配置 ######################################
+# 需求实现计划 §7 阶段 A：视频帧独立二进制通道（type=2）+ 录制 + 视觉分析 + 多模态消息 + 生命周期
+# 关闭时（enable: false）现有音频链路行为零变化
+video:
+  # 视频总开关（默认关闭：不开启时不会解析任何视频帧）
+  enable: false
+  # 服务端存放视频与会话产物的目录
+  output_dir: "data/video"
+  # 期望帧率：只用于事前约束体积（D3 不设发送时体积上限，D14 已删除 20MB 保护）
+  fps: 10
+  # 分辨率：设备侧采集参数的事前约束（实际以设备上报帧为准）
+  width: 320
+  height: 240
+  # 单段最长时长（毫秒）：超过后自动切段，避免单条消息过大（事前约束，不是发送时拦截）
+  max_segment_ms: 60000
+  # 帧缓冲上限（满了丢最旧，保证永不积压，D15）
+  max_buffer_frames: 600
+  # 是否跑视觉分析（②）：关闭则只录制视频、不产出结构化 JSON
+  analyze: true
+  # 是否把标注视频一并落盘
+  annotate: true
+  # 标注视频/帧的 JPEG 质量
+  jpeg_quality: 80
+  # ⑥ + D5：视频保留轮数。0 = 整个会话保留（默认）；N = 只保留最近 N 轮引用
+  retention_rounds: 0
+  # 兜底清理：超过该秒数仍无活动的会话视频视为孤儿
+  orphan_ttl_seconds: 3600
+
+  # D15 三级差异化实时调度
+  scheduler:
+    # YOLO 检测间隔（帧）：每 3 帧检测 1 次
+    detect_every_n_frames: 3
+    # 人脸检测+识别间隔（帧）：每 15 帧 1 次
+    face_every_n_frames: 15
+    # 单帧处理预算（毫秒）：30fps -> 33ms
+    target_budget_ms: 33
+    # 超预算时自动加大检测间隔
+    adaptive: true
+    # 检测间隔上限（降级到最保守档位）
+    max_detect_interval: 6
+    # 检测输入尺寸（降分辨率档位）
+    detector_input_size: 320
+
+  # ② 人物检测（YOLO + ByteTrack 跟踪）
+  detector:
+    # ultralytics YOLO 权重；未安装 ultralytics 时若配置了 model_path 会尝试 ONNX 后端
+    model_path: "yolov8n.pt"
+    conf: 0.35
+    imgsz: 320
+
+  # ② 人脸识别（D4：InsightFace(ArcFace) + SQLite 底库；未安装 insightface 时整体关闭）
+  face:
+    model_name: "buffalo_l"
+    det_size: 320
+    db_path: "data/video/faces.db"
+    similarity: 0.45
+
+  # ② 谁在说话（D12 方案 A 音画启发式；可替换为 asd 检测器）
+  speaker:
+    speaker_detector: "heuristic"   # heuristic | asd
+    w_area: 0.35
+    w_yaw: 0.25
+    w_mouth: 0.30
+    w_voiceprint: 0.10
+    threshold: 0.5
+
+  # ④ 视频供应商（D3/D7：OpenAI 兼容网关，video_url 内容块 + base64 内联）
+  # 不配置时使用 MockVideoLLM 或降级为纯文本，不影响对话
+  provider:
+    base_url: ""
+    model_name: ""
+    api_key: ""
+

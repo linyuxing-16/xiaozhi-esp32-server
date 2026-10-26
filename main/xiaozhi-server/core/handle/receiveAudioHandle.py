@@ -17,6 +17,8 @@ TAG = __name__
 async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
     # 当前片段是否有人说话
     have_voice = conn.vad.is_vad(conn, pcm_frame)
+    # 视频会话：记录 PCM 与用户说话区间（需求 ①④）
+    _track_video_audio(conn, pcm_frame, have_voice)
     # 如果设备刚刚被唤醒，短暂忽略VAD检测
     if hasattr(conn, "just_woken_up") and conn.just_woken_up:
         have_voice = False
@@ -32,6 +34,20 @@ async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
     await no_voice_close_connect(conn, have_voice)
     # 接收音频
     await conn.asr.receive_audio(conn, pcm_frame, have_voice)
+
+
+def _track_video_audio(conn: "ConnectionHandler", pcm_frame, have_voice):
+    """把音频与 VAD 上升沿喂给视频会话（未开启视频时零开销）。"""
+    video_session = getattr(conn, "video_session", None)
+    if video_session is None:
+        return
+    try:
+        video_session.push_pcm(pcm_frame)
+        if have_voice and not getattr(conn, "_video_voice_active", False):
+            conn._video_voice_active = True
+            video_session.on_user_speech_start()
+    except Exception as e:
+        conn.logger.bind(tag=TAG).debug(f"视频会话记录音频失败: {e}")
 
 
 async def resume_vad_detection(conn: "ConnectionHandler"):

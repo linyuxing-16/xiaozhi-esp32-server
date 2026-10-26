@@ -28,6 +28,121 @@ TAG = __name__
 logger = setup_logging()
 
 
+def _notify_video_speech_stop(conn: "ConnectionHandler"):
+    """VAD 下降沿通知视频会话（未开启视频时零开销）。"""
+    video_session = getattr(conn, "video_session", None)
+    if video_session is None:
+        return
+    try:
+        conn._video_voice_active = False
+        video_session.on_user_speech_stop()
+    except Exception as exc:  # noqa: BLE001
+        logger.bind(tag=TAG).debug(f"视频会话记录说话结束失败: {exc}")
+
+
+def parse_asr_timestamp_items(raw_text) -> list:
+    """尝试从 ASR 返回里提取句级时间戳（供应商差异很大，全部按可选处理）。"""
+    import re
+
+    if isinstance(raw_text, dict):
+        for key in ("sentences", "segments", "result"):
+            value = raw_text.get(key)
+            if isinstance(value, list):
+                return value
+        # 时间戳可能在 "timestamp" 字段里（FunASR 风格）
+        timestamp = raw_text.get("timestamp")
+        text = raw_text.get("text") or raw_text.get("content") or ""
+        if isinstance(timestamp, list) and text:
+            items = []
+            cursor = 0
+            for stamp in timestamp:
+                if not isinstance(stamp, (list, tuple)) or len(stamp) < 2:
+                    continue
+                start, end = int(stamp[0]), int(stamp[1])
+                chunk = text[cursor : cursor + max(1, (end - start) // 1)]
+                cursor += len(chunk)
+                if chunk:
+                    items.append({"text": chunk, "start": start, "end": end})
+            if items:
+                return items
+    if isinstance(raw_text, str):
+        text = raw_text.strip()
+        # 有些适配器把结构化结果 JSON 序列化成字符串返回
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                return parse_asr_timestamp_items(json.loads(text))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        # 形如 "[1200,4300]你好 [5100,7800]我想出去走走"
+        pattern = r"\[(\d+)\s*,\s*(\d+)\]([^\[]+)"
+        return [
+            {"start": int(a), "end": int(b), "text": t.strip()}
+            for a, b, t in re.findall(pattern, text)
+            if t.strip()
+        ]
+    return []
+
+
+def _normalize_asr_for_video(conn, raw_text, pcm_bytes: bytes, speaker_name):
+    """把 ASR 结果归一化并保存到 conn，供视频轮次组装消息（需求 ③④）。"""
+    video_session = getattr(conn, "video_session", None)
+    try:
+        from core.utils.asr_result import normalize_asr_result
+
+        supports_ts = bool(getattr(conn.asr, "supports_sentence_timestamp", False))
+        items = parse_asr_timestamp_items(raw_text)
+        if items:
+            raw = {"sentences": items, "speaker": speaker_name}
+            supports_ts = True
+        elif isinstance(raw_text, dict):
+            raw = dict(raw_text)
+            if speaker_name:
+                raw.setdefault("speaker", speaker_name)
+        else:
+            raw = {"content": raw_text or "", "speaker": speaker_name}
+
+        duration_ms = int(
+            len(pcm_bytes) / (16000 * 2) * 1000
+        ) if pcm_bytes else 0
+        result = normalize_asr_result(
+            raw,
+            duration_ms=duration_ms,
+            vad_segments=_vad_segments_for(conn),
+            voiceprint_id=speaker_name,
+            supports_sentence_timestamp=supports_ts,
+        )
+        conn.video_asr_result = result
+        if video_session is not None:
+            try:
+                from core.utils.asr_result import save_asr_result
+
+                paths = save_asr_result(
+                    result,
+                    getattr(video_session, "output_dir", "data/video"),
+                    conn.session_id,
+                    video_session.round_index + 1,
+                )
+                logger.bind(tag=TAG).info(
+                    f"③ ASR 归一化结果已保存: {paths['yaml']}（{len(result.sentences)} 句）"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.bind(tag=TAG).warning(f"ASR 归一化结果保存失败: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        logger.bind(tag=TAG).warning(f"ASR 归一化失败（不影响对话）: {exc}")
+
+
+def _vad_segments_for(conn) -> list:
+    """从视频会话的说话区间推一个 VAD 近似区间（只有一段）。"""
+    video_session = getattr(conn, "video_session", None)
+    if video_session is None:
+        return []
+    span = getattr(video_session, "_user_span", None)
+    if not span:
+        return []
+    start, end = span
+    return [(0, max(1, int(end) - int(start)))]
+
+
 class ASRProviderBase(ABC):
     def __init__(self):
         pass
@@ -73,6 +188,8 @@ class ASRProviderBase(ABC):
 
             # 自动模式下通过VAD检测到语音停止时触发识别
             if conn.asr.interface_type != InterfaceType.STREAM and conn.client_voice_stop:
+                # 视频会话：VAD 下降沿，关闭用户说话区间（需求 ①④）
+                _notify_video_speech_stop(conn)
                 # 直接使用asr_audio中的PCM数据
                 pcm_bytes = b"".join(conn.asr_audio)
                 # 检查是否有足够的音频数据（每帧1920字节，15帧约28800字节）
@@ -166,6 +283,8 @@ class ASRProviderBase(ABC):
             if text_len > 0:
                 audio_snapshot = asr_audio_task.copy()
                 enqueue_asr_report(conn, enhanced_text, audio_snapshot)
+                # 需求 ③：把 ASR 结果归一化为 编号/内容/声纹id/时间[xx,xx]（D13）
+                _normalize_asr_for_video(conn, raw_text, combined_pcm_data, speaker_name)
                 # 使用自定义模块进行上报
                 await startToChat(conn, enhanced_text)
         except Exception as e:

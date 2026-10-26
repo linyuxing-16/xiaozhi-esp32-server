@@ -58,6 +58,19 @@ async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
             conn.logger.bind(tag=TAG).debug("客户端启用了服务端AEC")
             conn.client_aec = True
 
+    # 视频能力协商（D11）：服务端开启 video.enable 才在 hello 中回应 video 能力
+    video_session = getattr(conn, "video_session", None)
+    if video_session is not None and video_session.enabled:
+        features_out = conn.welcome_msg.setdefault("features", {})
+        features_out["video"] = {
+            "enable": True,
+            "fps": video_session.fps,
+            "transport": "binary",
+            "frame_type": 2,
+            "format": "jpeg",
+        }
+        conn.logger.bind(tag=TAG).info("服务端已开启视频能力，hello 中已声明 features.video")
+
     await conn.websocket.send(json.dumps(conn.welcome_msg))
 
     # The device waits for the server hello before processing MCP messages.

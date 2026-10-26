@@ -42,6 +42,10 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
             # 新句子或流控器未初始化，立即发送
             await send_tts_message(conn, "sentence_start", text)
 
+    # 需求 ⑤（D10）：设备输出音频时段单独录像（静音）
+    if sentenceType == SentenceType.FIRST:
+        _video_tts_start(conn)
+
     await sendAudio(conn, audios)
     # 发送句子开始消息
     if sentenceType is not SentenceType.MIDDLE:
@@ -50,9 +54,32 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
     # 发送结束消息（如果是最后一个文本）
     # 通话需要维持speaking状态
     if not conn.calling and sentenceType == SentenceType.LAST:
+        _video_tts_stop(conn)
         await send_tts_message(conn, "stop", None)
         if conn.close_after_chat:
             await conn.close()
+
+
+def _video_tts_start(conn: "ConnectionHandler"):
+    """TTS 首帧：开始小智输出音频段的录像区间（未开启视频时零开销）。"""
+    video_session = getattr(conn, "video_session", None)
+    if video_session is None:
+        return
+    try:
+        video_session.on_tts_start()
+    except Exception as e:
+        conn.logger.bind(tag=TAG).debug(f"[video] 记录 TTS 开始失败: {e}")
+
+
+def _video_tts_stop(conn: "ConnectionHandler"):
+    """TTS 结束：关闭小智输出音频段的录像区间。"""
+    video_session = getattr(conn, "video_session", None)
+    if video_session is None:
+        return
+    try:
+        video_session.on_tts_stop()
+    except Exception as e:
+        conn.logger.bind(tag=TAG).debug(f"[video] 记录 TTS 结束失败: {e}")
 
 
 async def _wait_for_audio_completion(conn: "ConnectionHandler"):
@@ -285,6 +312,11 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
     """发送 TTS 状态消息"""
     if text is None and state == "sentence_start":
         return
+    # 需求 ⑤（D10）：设备开始输出音频 -> 开始录像区间；播放结束 -> 关闭区间
+    if state == "start":
+        _video_tts_start(conn)
+    elif state == "stop":
+        _video_tts_stop(conn)
     message = {"type": "tts", "state": state, "session_id": conn.session_id}
     if text is not None:
         message["text"] = textUtils.check_emoji(text)

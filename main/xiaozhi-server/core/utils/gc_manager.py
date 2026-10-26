@@ -71,6 +71,8 @@ class GlobalGCManager:
 
                 # 执行GC
                 await self._run_gc()
+                # 需求 ⑥ + D5：兜底清理孤儿视频文件
+                await self._sweep_video_orphans()
 
         except asyncio.CancelledError:
             logger.bind(tag=TAG).info("GC循环任务被取消")
@@ -79,6 +81,19 @@ class GlobalGCManager:
             logger.bind(tag=TAG).error(f"GC循环任务异常: {e}")
         finally:
             logger.bind(tag=TAG).info("GC循环任务已退出")
+
+    async def _sweep_video_orphans(self):
+        """定时兜底：清理进程崩溃/超时会话残留的视频文件（D5）。"""
+        try:
+            from core.utils.video.store import get_video_store
+
+            loop = asyncio.get_running_loop()
+            store = get_video_store()
+            removed = await loop.run_in_executor(None, store.sweep_orphans)
+            if removed:
+                logger.bind(tag=TAG).info(f"视频兜底清理完成，移除 {len(removed)} 个文件")
+        except Exception as e:
+            logger.bind(tag=TAG).debug(f"视频兜底清理跳过: {e}")
 
     async def _run_gc(self):
         """执行垃圾回收"""

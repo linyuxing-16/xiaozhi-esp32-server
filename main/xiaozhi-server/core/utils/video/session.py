@@ -1,7 +1,8 @@
 """单连接视频会话编排（阶段 A/C/D/F/G 的接线层）。
 
 把"设备推来的 JPEG 帧 + 服务端解出的 PCM"按需求切成两段：
-- 用户说话段（需求 ④）：VAD 上升沿 -> 下降沿，保留音轨；
+- 用户说话段（需求 ④）：VAD 上升沿 -> 下降沿；保留音轨是既有行为，
+  ④ 原文未规定音轨（⑤ 才明确"不录音"）；
 - 小智输出音频段（需求 ⑤）：TTS 起 -> TTS 止，静音（D10）；
 两段都过视觉分析（需求 ②），并在下一轮对话前组装成消息附件。
 
@@ -294,29 +295,11 @@ class VideoSession:
         if not window:
             return None, None
 
-        video_path: Optional[str] = None
-        try:
-            recorder = self._get_recorder()
-            result = recorder.render(
-                RecordingRequest(
-                    session_id=self.session_id,
-                    kind=kind,
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    frames=window,
-                    pcm_frames=() if kind == "tts" else pcm_frames,
-                    fps=self.fps,
-                )
-            )
-            if result.ok:
-                video_path = result.path
-            else:
-                artifacts.notes.append(f"{kind} 录制失败: {result.error}")
-        except Exception as exc:  # noqa: BLE001
-            logger.bind(tag=TAG).error(f"[video] {kind} 录制异常: {exc}")
-            artifacts.notes.append(f"{kind} 录制异常: {exc}")
-
         analysis: Optional[dict] = None
+        annotated_path: Optional[str] = None
+
+        # 需求 ②④⑤：先跑分析拿到"经过②处理的视频"（画了 person_id / face_id /
+        # 是否说话的标注视频），发给 LLM 的应当是这一版，而不是未处理的原始帧。
         if self.analyze:
             try:
                 pipeline = self._get_pipeline()
@@ -333,10 +316,10 @@ class VideoSession:
                         "frames": result.frames,
                         "stats": result.stats,
                     }
-                    # 标注视频同样纳入生命周期（⑥）：会话结束一并删除
-                    if result.video_path:
+                    annotated_path = result.video_path
+                    if annotated_path:
                         self.store.register(
-                            result.video_path,
+                            annotated_path,
                             self.session_id,
                             self.round_index,
                             "annotated",
@@ -350,6 +333,35 @@ class VideoSession:
             except Exception as exc:  # noqa: BLE001
                 logger.bind(tag=TAG).error(f"[video] {kind} 视觉分析异常: {exc}")
                 artifacts.notes.append(f"{kind} 视觉分析异常: {exc}")
+
+        video_path: Optional[str] = None
+        if annotated_path:
+            # ④⑤ 统一使用无音轨的标注视频：音频信息已由 ③ 的 ASR 文本承载，
+            # 视频本身不需要音轨（⑤ 原文也明确"不录音"）。
+            video_path = annotated_path
+
+        # 兜底：分析关闭 / 分析失败 / 封装失败时，退回原始帧录制
+        if video_path is None:
+            try:
+                recorder = self._get_recorder()
+                result = recorder.render(
+                    RecordingRequest(
+                        session_id=self.session_id,
+                        kind=kind,
+                        start_ms=start_ms,
+                        end_ms=end_ms,
+                        frames=window,
+                        pcm_frames=() if kind == "tts" else pcm_frames,
+                        fps=self.fps,
+                    )
+                )
+                if result.ok:
+                    video_path = result.path
+                else:
+                    artifacts.notes.append(f"{kind} 录制失败: {result.error}")
+            except Exception as exc:  # noqa: BLE001
+                logger.bind(tag=TAG).error(f"[video] {kind} 录制异常: {exc}")
+                artifacts.notes.append(f"{kind} 录制异常: {exc}")
         return video_path, analysis
 
     def _save_frames_json(self, analysis: dict, kind: str) -> Optional[str]:

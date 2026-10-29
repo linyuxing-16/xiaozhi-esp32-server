@@ -42,6 +42,7 @@ def draw_annotations(
         return image
 
     canvas = image if image.flags.writeable else image.copy()
+    height, width = canvas.shape[:2]
     for obj in objects:
         bbox = obj.get("bbox") or []
         if len(bbox) != 4:
@@ -54,34 +55,39 @@ def draw_annotations(
         thickness = THICKNESS if detected else 1
         cv2.rectangle(canvas, (x1, y1), (x2, y2), color, thickness, linestyle)
 
+        # 标签要能被多模态模型读出来：字号随画面放大、face_id 只留短后缀、
+        # 文字背后垫一块实心底板（否则小画面 + H.264 压缩后完全糊掉）。
         label_parts = [f"id={obj.get('person_id', '?')}"]
         face_id = obj.get("face_id")
         if face_id:
-            label_parts.append(f"face={face_id}")
+            label_parts.append(f"face={short_face_id(face_id)}")
         label_parts.append("speaking" if speaking else "silent")
-        if not detected:
-            label_parts.append("tracked")
         label = " ".join(label_parts)
+        label = fit_label(label, width)
 
-        text_y = max(12, y1 - 6)
-        cv2.putText(
+        scale, thickness = _label_style(width)
+        (text_w, text_h), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
+        )
+        text_x = max(0, min(x1, width - text_w - 2))
+        text_y = y1 - baseline - 2
+        if text_y - text_h < 0:
+            text_y = min(height - baseline - 2, y1 + text_h + baseline + 2)
+        cv2.rectangle(
             canvas,
-            label,
-            (x1, text_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
-            TEXT_COLOR,
-            2,
-            cv2.LINE_AA,
+            (text_x, text_y - text_h - baseline),
+            (text_x + text_w + 2, text_y + baseline),
+            (0, 0, 0),
+            -1,
         )
         cv2.putText(
             canvas,
             label,
-            (x1, text_y),
+            (text_x, text_y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            font_scale,
+            scale,
             color,
-            1,
+            thickness,
             cv2.LINE_AA,
         )
 
@@ -91,6 +97,27 @@ def draw_annotations(
             cv2.rectangle(canvas, (fx1, fy1), (fx2, fy2), FACE_COLOR, 1, cv2.LINE_AA)
 
     return canvas
+
+
+def _label_style(frame_width: int) -> tuple:
+    """按画面宽度决定字号/线宽（320 宽用 0.55 以上才读得清）。"""
+    if frame_width >= 640:
+        return 0.8, 2
+    if frame_width >= 480:
+        return 0.7, 2
+    return 0.6, 1
+
+
+def short_face_id(face_id: str, keep: int = 6) -> str:
+    """face_id 太长会撑出画面，只保留可辨识的后缀。"""
+    text = str(face_id)
+    return text if len(text) <= keep * 2 else text[-keep:]
+
+
+def fit_label(label: str, frame_width: int) -> str:
+    """标签超出画面宽度时截断，避免被裁掉一半。"""
+    max_chars = max(8, frame_width // 9)
+    return label if len(label) <= max_chars else label[: max_chars - 1] + "…"
 
 
 def decode_jpeg(data: bytes) -> Optional[np.ndarray]:

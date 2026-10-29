@@ -1,9 +1,12 @@
 """录制与音画对齐（需求 ①④⑤，阶段 C）。
 
 职责：
-- 用户说话段（④）：VAD 上升沿 -> 下降沿，JPEG 帧 + PCM 音轨封装为 mp4；
+- 用户说话段（④）：VAD 上升沿 -> 下降沿，JPEG 帧封装为 mp4（无音轨）；
 - 小智输出音频段（⑤）：TTS 首帧 -> TTS 结束，只有视频流（静音，D10）；
-- 时间轴原点对齐（①）：以各自区间的起点为 t=0，视频帧时间戳平移后与音频严格同起点。
+- 时间轴原点对齐（①）：以各自区间的起点为 t=0，视频帧时间戳平移后对齐。
+
+音轨说明：④⑤ 都不封装音轨。④ 原文只要求"经过②处理过后的视频 + ③的文本"，
+音频信息由 ③ 的 ASR 文本承载；⑤ 原文明确"不录音"。
 
 实现方式：把区间内的 JPEG 帧按各自时间戳写成 ffmpeg concat 列表（保留每帧真实间隔），
 再交给 ffmpeg 封装。没有 ffmpeg 时不抛异常，返回失败原因（能力探测已提前告警）。
@@ -225,15 +228,9 @@ class VideoRecorder:
             args: List[str] = ["ffmpeg", "-y", "-loglevel", "error"]
             args += ["-f", "concat", "-safe", "0", "-i", list_path]
 
+            # ④⑤ 统一不封装音轨：音频信息由 ③ 的 ASR 文本承载，
+            # 视频不需要音轨（⑤ 原文明确"不录音"，④ 原文也未要求音轨）。
             has_audio = False
-            if not request.silence:
-                pcm = collect_pcm(request.pcm_frames, request.start_ms, request.end_ms)
-                if pcm:
-                    wav_path = os.path.join(workdir, "audio.wav")
-                    with open(wav_path, "wb") as handle:
-                        handle.write(pcm_bytes_to_wav(pcm))
-                    args += ["-i", wav_path]
-                    has_audio = True
 
             if self.use_h264:
                 args += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"]
@@ -242,10 +239,7 @@ class VideoRecorder:
 
             # ffmpeg 7+ 移除了 -vsync（改为 -fps_mode）；用 -r 控制输出帧率即可
             args += ["-r", str(self.fps)]
-            if has_audio:
-                args += ["-c:a", "aac", "-shortest"]
-            else:
-                args += ["-an"]
+            args += ["-an"]
             args += ["-movflags", "+faststart", output_path]
 
             ok, error = _run_ffmpeg(args)

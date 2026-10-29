@@ -78,7 +78,8 @@ def test_collect_pcm_crops_to_range():
     assert len(cropped) == 16000 * 2
 
 
-def test_user_recording_has_audio_track(workdir):
+def test_user_recording_has_no_audio_track(workdir):
+    """④ 也不封装音轨：音频信息由 ③ 的 ASR 文本承载。"""
     recorder = VideoRecorder(workdir, fps=10)
     request = RecordingRequest(
         session_id="sess_user",
@@ -86,15 +87,14 @@ def test_user_recording_has_audio_track(workdir):
         start_ms=0,
         end_ms=1900,
         frames=_make_frames(20),
-        pcm_frames=[PcmFrame(0, _pcm(2000))],
+        pcm_frames=[PcmFrame(0, _pcm(2000))],  # 即便传了 PCM，④ 也不封装音轨
     )
     result = recorder.render(request)
     if not result.ok:
         pytest.skip(f"ffmpeg 不可用: {result.error}")
-    assert result.has_audio is True
+    assert result.has_audio is False
     streams = ffprobe_streams(result.path)
-    assert "video" in streams
-    assert "audio" in streams
+    assert streams == ["video"], f"④ 必须只有视频流，实际: {streams}"
 
 
 def test_tts_recording_is_silent(workdir):

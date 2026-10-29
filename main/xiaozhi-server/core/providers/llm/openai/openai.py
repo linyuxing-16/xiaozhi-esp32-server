@@ -10,6 +10,7 @@ TAG = __name__
 logger = setup_logging()
 
 # 需要禁用思考模式的平台域名及其对应参数（默认关闭思考模式）
+# 可通过配置 disable_thinking: false 关闭此自动行为，或用 thinking_off_params 覆盖参数
 THINKING_DISABLED_DOMAINS = {
     "aliyuncs.com": {"enable_thinking": False},
     "deepseek.com": {"thinking": {"type": "disabled"}},
@@ -43,6 +44,15 @@ class LLMProvider(LLMProviderBase):
         else:
             # 未配置或配置无效，使用默认值
             custom_timeout = httpx.Timeout(300)
+
+        # ===== 推理模型相关配置 =====
+        # disable_thinking: 是否关闭模型的思考/推理（默认 true，保持原行为）
+        self.disable_thinking = config.get("disable_thinking", True)
+        # thinking_off_params: 自定义"关闭思考"时要发送的额外参数，
+        # 未配置则按 THINKING_DISABLED_DOMAINS 中匹配到的域名参数发送
+        self.thinking_off_params = config.get("thinking_off_params") or {}
+        # extra_body: 原样透传给接口的额外参数（优先级最高，可覆盖上面的自动参数）
+        self.extra_body = config.get("extra_body") or {}
 
         param_defaults = {
             "max_tokens": int,
@@ -80,14 +90,44 @@ class LLMProvider(LLMProviderBase):
         return dialogue
 
     def _apply_thinking_disabled(self, request_params: dict):
-        """根据域名自动禁用思考模式"""
-        parsed_url = urlparse(self.base_url)
-        domain = parsed_url.netloc
-        for disabled_domain, params in THINKING_DISABLED_DOMAINS.items():
-            if disabled_domain in domain:
-                request_params.setdefault("extra_body", {}).update(params)
-                logger.bind(tag=TAG).info(f"为域名 {domain} 禁用思考模式，参数: {params}")
-                break
+        """按配置关闭模型的思考/推理模式
+
+        参数来源优先级：
+        1. 配置项 thinking_off_params（显式指定，适配任意厂商）
+        2. 域名匹配 THINKING_DISABLED_DOMAINS（内置已知平台）
+        """
+        if not self.disable_thinking:
+            logger.bind(tag=TAG).debug("disable_thinking 为 false，不关闭模型思考模式")
+            return
+
+        params = self.thinking_off_params
+        source = "配置项 thinking_off_params"
+
+        if not params:
+            parsed_url = urlparse(self.base_url)
+            domain = parsed_url.netloc
+            for disabled_domain, disabled_params in THINKING_DISABLED_DOMAINS.items():
+                if disabled_domain in domain:
+                    params = disabled_params
+                    source = f"内置域名规则 {disabled_domain}"
+                    break
+
+        if params:
+            request_params.setdefault("extra_body", {}).update(params)
+            logger.bind(tag=TAG).info(f"关闭思考模式（{source}），参数: {params}")
+        else:
+            logger.bind(tag=TAG).warning(
+                "disable_thinking 已开启，但该服务商不在内置规则中且未配置 "
+                "thinking_off_params，无法自动关闭思考模式。"
+                "请在配置中增加 thinking_off_params，例如：\n"
+                "  thinking_off_params:\n"
+                "    thinking: {type: disabled}"
+            )
+
+    def _apply_extra_body(self, request_params: dict):
+        """用户配置的 extra_body 优先级最高，可覆盖自动生成的参数"""
+        if self.extra_body:
+            request_params.setdefault("extra_body", {}).update(self.extra_body)
 
     def response(self, session_id, dialogue, **kwargs):
         dialogue = self.normalize_dialogue(dialogue)
@@ -110,8 +150,10 @@ class LLMProvider(LLMProviderBase):
             if value is not None:
                 request_params[key] = value
 
-        # 禁用思考模式
+        # 按配置关闭思考模式（disable_thinking / thinking_off_params）
         self._apply_thinking_disabled(request_params)
+        # 用户自定义 extra_body 最后合并，优先级最高
+        self._apply_extra_body(request_params)
 
         responses = self.client.chat.completions.create(**request_params)
 
@@ -156,8 +198,10 @@ class LLMProvider(LLMProviderBase):
             if value is not None:
                 request_params[key] = value
 
-        # 禁用思考模式
+        # 按配置关闭思考模式（disable_thinking / thinking_off_params）
         self._apply_thinking_disabled(request_params)
+        # 用户自定义 extra_body 最后合并，优先级最高
+        self._apply_extra_body(request_params)
 
         stream = self.client.chat.completions.create(**request_params)
 

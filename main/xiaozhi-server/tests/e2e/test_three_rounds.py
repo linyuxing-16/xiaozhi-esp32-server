@@ -178,14 +178,14 @@ def test_three_rounds_end_to_end(workdir):
         assert os.path.exists(artifacts.user_video)
         assert os.path.exists(artifacts.tts_video)
 
-    # ---------------- 断言：⑤ 无音轨（ffprobe） ----------------
+    # ---------------- 断言：④⑤ 均无音轨（ffprobe） ----------------
     for artifacts in all_rounds:
         streams = ffprobe_streams(artifacts.tts_video)
         if not streams:
             pytest.skip("ffprobe 不可用，跳过音轨校验")
         assert streams == ["video"], f"⑤ 必须只有视频流，实际 {streams}"
         user_streams = ffprobe_streams(artifacts.user_video)
-        assert "audio" in user_streams, f"④ 应保留音轨，实际 {user_streams}"
+        assert user_streams == ["video"], f"④ 也必须只有视频流，实际 {user_streams}"
 
     # ---------------- 断言：② 结构化 JSON 字段与 face_id 一致性 ----------------
     face_ids = set()

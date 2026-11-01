@@ -174,20 +174,17 @@ class MouthMotionTracker:
         roi = frame_gray[my1:y2, x1:x2]
         if roi.size == 0:
             return 0.0
-        roi = roi.astype(np.float32)
-        roi = roi.reshape(32, -1) if roi.size >= 32 else roi.reshape(-1)
-        # 统一到固定长度，避免不同帧尺寸无法比较
+        # 统一到固定长度（32x32=1024），避免不同帧尺寸无法比较。
+        # 注意：ROI 的像素总数通常不是 32 的整数倍，不能先 reshape(32, -1)，
+        # 这里直接展平后截断/补零。
         target = 32 * 32
-        if roi.size != target:
-            flat = roi.flatten()
-            if flat.size < target:
-                padded = np.zeros(target, dtype=np.float32)
-                padded[: flat.size] = flat
-                roi = padded
-            else:
-                roi = flat[:target]
+        flat = roi.astype(np.float32).flatten()
+        if flat.size < target:
+            padded = np.zeros(target, dtype=np.float32)
+            padded[: flat.size] = flat
+            roi = padded
         else:
-            roi = roi.flatten()
+            roi = flat[:target]
 
         previous = self._prev.get(person_id)
         self._prev[person_id] = roi

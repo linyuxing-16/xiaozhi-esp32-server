@@ -42,3 +42,8 @@ psutil==7.2.2
 portalocker==3.2.0  # 暂留 3.x：4.x 与 qdrant-client<1.20 的 portalocker<4.0 约束冲突 (PR #3360)
 Jinja2==3.1.6
 vosk==0.3.45
+# --------- 视频管线：人脸识别（FaceRecognizer 依赖 InsightFace + ArcFace 权重 buffalo_l）
+# insightface>=1.0 提供纯 py3 wheel（无需 MSVC 编译）；0.7.x 在 Python 3.12 上需本地编译 Cython 扩展
+# onnx 钉 1.16.2：新版 onnx 会把 protobuf 拉到 >=6，与 google-generativeai(<6) / mem0ai(<7) 冲突
+insightface==2.1
+onnx==1.16.2

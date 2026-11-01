@@ -31,7 +31,11 @@ from core.utils.video.frames import (
     now_ms,
     parse_video_frame,
 )
-from core.utils.video.pipeline import PipelineConfig, VideoPipeline
+from core.utils.video.pipeline import (
+    PipelineConfig,
+    VideoPipeline,
+    get_video_pipeline,
+)
 from core.utils.video.recorder import PcmFrame, RecordingRequest, VideoRecorder
 from core.utils.video.speaker import SpeechSegment
 from core.utils.video.store import VideoStore, get_video_store
@@ -396,11 +400,15 @@ class VideoSession:
         return self._recorder
 
     def _get_pipeline(self) -> VideoPipeline:
-        if self._pipeline is None:
-            self._pipeline = VideoPipeline(
-                PipelineConfig.from_config(self.config), output_dir=self.output_dir
-            )
-        return self._pipeline
+        """取视觉管线。
+
+        - 构造时注入的管线优先（测试用）；
+        - 否则复用进程级单例：模型（YOLO + InsightFace，约 12s / 620MB）只在
+          进程内加载一次，所有会话共享，避免每个连接重付冷启动成本。
+        """
+        if self._pipeline is not None:
+            return self._pipeline
+        return get_video_pipeline(self.config, self.output_dir)
 
     # ------------------------------------------------------------ 清理
     def close(self) -> List[str]:
@@ -412,12 +420,10 @@ class VideoSession:
         self._frames.clear()
         with self._lock:
             self._pcm.clear()
-        if self._pipeline is not None:
-            try:
-                self._pipeline.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._pipeline = None
+        # 注意：这里不关闭 _pipeline。管线已是进程级单例、被所有会话共享，
+        # 关闭会连带弄坏其他活跃会话，并让下一次连接重新付 12s 模型加载成本；
+        # 统一由 reset_video_pipeline() 在进程退出时关闭。
+        self._pipeline = None
         return self.store.close_session(self.session_id)
 
 

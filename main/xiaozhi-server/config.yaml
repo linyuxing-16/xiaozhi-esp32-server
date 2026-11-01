@@ -1230,6 +1230,12 @@ video:
   max_buffer_frames: 600
   # 是否跑视觉分析（②）：关闭则只录制视频、不产出结构化 JSON
   analyze: true
+  # 启动时后台预加载视觉模型（YOLOv8n + InsightFace buffalo_l，实测约 12s、常驻约 620MB）。
+  # 模型是进程级单例，只加载一次由所有连接共享：
+  #   true  = 启动后台线程预热，服务启动时间不变，首个连接秒开；
+  #   false = 不预热，第一个连接自己承担加载耗时（约 12s，会推高首字延迟）。
+  # analyze=false 时该项无效（该模式只录像，不用模型）。
+  preload: true
   # 是否把标注视频一并落盘
   annotate: true
   # 标注视频/帧的 JPEG 质量

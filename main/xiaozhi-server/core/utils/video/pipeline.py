@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -106,7 +107,9 @@ class VideoPipeline:
         self.speaker_detector = speaker_detector or build_speaker_detector(
             self.config.speaker
         )
-        self.mouth_tracker = MouthMotionTracker()
+        # 注意：MouthMotionTracker 是"按 person_id 记账"的有状态对象，而 person_id
+        # 每轮视频都从 1 重新开始编号。因此它绝不能挂在 pipeline 上（pipeline 现已
+        # 是进程级单例，所有会话共享），必须在 analyze() 里按轮次新建，见 state["mouth_tracker"]。
 
     # ------------------------------------------------------------------ 单帧
     def _analyze_frame(
@@ -173,7 +176,9 @@ class VideoPipeline:
             face_id = cached_ids.get(track.track_id)
             mouth_motion = 0.0
             if gray is not None:
-                mouth_motion = self.mouth_tracker.update(track.track_id, gray, face_box)
+                mouth_motion = state["mouth_tracker"].update(
+                    track.track_id, gray, face_box
+                )
             candidates.append(
                 SpeakerCandidate(
                     person_id=track.track_id,
@@ -254,6 +259,8 @@ class VideoPipeline:
             "elapsed": [],
             "faces": {},
             "face_ids": {},
+            # 每轮新建：person_id 每轮从 1 重编号，跨轮/跨会话共享会互相污染嘴部历史
+            "mouth_tracker": MouthMotionTracker(),
         }
         voiceprint_history: Dict[str, str] = {}
 
@@ -371,3 +378,83 @@ class VideoPipeline:
     def close(self) -> None:
         if self.recognizer is not None:
             self.recognizer.close()
+
+
+# ---------------------------------------------------------------- 进程级单例
+# 模型加载实测约 12s / 常驻 620MB（YOLOv8n + InsightFace buffalo_l）。
+# 若每个 WebSocket 连接都新建管线，冷启动成本会被摊到该连接的第一次对话上，
+# 直接表现为"本轮视频准备耗时 35~46 秒、首字延迟爆炸"。
+# 因此管线提升为进程级单例：启动预加载一次，所有会话共享。
+#
+# 线程安全说明：
+# - 创建过程用双重检查锁保护，避免并发连接各自加载一份模型；
+# - 共享后 detector / recognizer 内部的推理调用各自加锁（见 detector.py / face.py），
+#   保证不串结果；
+# - 有状态对象（FrameScheduler / ByteTrackTracker / MouthMotionTracker / 人脸缓存）
+#   一律在 analyze() 内按轮次新建，不进单例。
+_pipeline: Optional["VideoPipeline"] = None
+_pipeline_lock = threading.Lock()
+
+
+def get_video_pipeline(
+    video_config: Optional[dict] = None,
+    output_dir: str = "data/video",
+) -> "VideoPipeline":
+    """取进程级共享的视觉管线（首次调用时加载模型，之后直接复用）。
+
+    双重检查锁：快路径无锁返回，慢路径串行化创建，确保并发下只加载一次。
+    """
+    global _pipeline
+    if _pipeline is not None:  # 快路径
+        return _pipeline
+    with _pipeline_lock:
+        if _pipeline is not None:  # 慢路径再判一次
+            return _pipeline
+        config = PipelineConfig.from_config(video_config)
+        pipeline = VideoPipeline(config, output_dir=output_dir)
+        # 首次推理还要额外付一次冷启动（算子选择/内存池），实测首次 analyze
+        # 比后续多 10s 左右。这里用一张小图各跑一次，把这份成本留在启动阶段。
+        _warmup(pipeline)
+        _pipeline = pipeline
+        logger.bind(tag=TAG).info(
+            f"[video] 视觉管线已创建（进程级单例，后续连接共享）output_dir={output_dir}"
+        )
+        return _pipeline
+
+
+def _warmup(pipeline: "VideoPipeline") -> None:
+    """预热一次检测/人脸推理，避免首个真实轮次承担冷启动。
+
+    失败只记 debug：预热属于性能优化，任何异常都不应影响功能。
+    """
+    try:
+        import numpy as _np
+
+        # 320x240 全零图：形状与实际设备帧一致，且不依赖任何模型权重内容。
+        blank = _np.zeros((240, 320, 3), dtype=_np.uint8)
+        started = time.monotonic()
+        try:
+            pipeline.detector.detect(blank)
+        except Exception as exc:  # noqa: BLE001
+            logger.bind(tag=TAG).debug(f"[video] 检测预热失败（不影响功能）: {exc}")
+        try:
+            pipeline.recognizer.detect(blank)
+        except Exception as exc:  # noqa: BLE001
+            logger.bind(tag=TAG).debug(f"[video] 人脸预热失败（不影响功能）: {exc}")
+        logger.bind(tag=TAG).info(
+            f"[video] 模型预热完成，耗时 {(time.monotonic() - started) * 1000:.0f}ms"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.bind(tag=TAG).debug(f"[video] 预热跳过: {exc}")
+
+
+def reset_video_pipeline() -> None:
+    """关闭并清空单例（仅供测试与进程退出时调用）。"""
+    global _pipeline
+    with _pipeline_lock:
+        if _pipeline is not None:
+            try:
+                _pipeline.close()
+            except Exception as exc:  # noqa: BLE001 - 退出路径不抛
+                logger.bind(tag=TAG).warning(f"[video] 关闭视觉管线异常: {exc}")
+            _pipeline = None

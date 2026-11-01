@@ -2,6 +2,7 @@ import sys
 import uuid
 import signal
 import asyncio
+import threading
 from aioconsole import ainput
 from config.settings import load_config
 from config.logger import setup_logging
@@ -43,6 +44,42 @@ async def monitor_stdin():
         await ainput()  # 异步等待输入，消费回车
 
 
+def _preload_video_pipeline(config: dict) -> None:
+    """后台线程预加载视觉管线（仅 video.enable 且 analyze 且 preload 时）。"""
+    video_config = config.get("video") or {}
+    if not video_config.get("enable", False):
+        return
+    if not video_config.get("analyze", False):
+        # 只录像不分析时不需要模型，省下 620MB
+        return
+    if not video_config.get("preload", True):
+        logger.bind(tag=TAG).info("[video] 已关闭预加载，首个连接将按需加载模型")
+        return
+
+    def _worker():
+        import time as _time
+
+        started = _time.monotonic()
+        try:
+            from core.utils.video.pipeline import get_video_pipeline
+
+            pipeline = get_video_pipeline(
+                video_config, video_config.get("output_dir", "data/video")
+            )
+            logger.bind(tag=TAG).info(
+                f"[video] 视觉管线预加载完成，耗时 "
+                f"{(_time.monotonic() - started) * 1000:.0f}ms"
+                f"（检测后端={getattr(pipeline.detector, 'name', 'unknown')}，"
+                f"人脸识别={'开' if getattr(pipeline.recognizer, 'enabled', False) else '关'}）"
+            )
+        except Exception as exc:  # noqa: BLE001 - 预加载失败只降级，不阻塞服务
+            logger.bind(tag=TAG).warning(
+                f"[video] 视觉管线预加载失败，回退为首个连接懒加载: {exc}"
+            )
+
+    threading.Thread(target=_worker, name="video-preload", daemon=True).start()
+
+
 async def main():
     check_ffmpeg_installed()
     config = await load_config()
@@ -67,6 +104,11 @@ async def main():
     # 启动全局GC管理器（5分钟清理一次）
     gc_manager = get_gc_manager(interval_seconds=300)
     await gc_manager.start()
+
+    # 视频视觉管线预加载：YOLO + InsightFace 加载实测约 12s / 常驻 620MB。
+    # 管线是进程级单例，放后台线程里加载一次，之后所有连接共享：
+    # 服务启动时间不变，但首个连接的"本轮视频准备"不再包含模型加载。
+    _preload_video_pipeline(config)
 
     # 启动 WebSocket 服务器
     ws_server = WebSocketServer(config)
@@ -127,6 +169,14 @@ async def main():
     except asyncio.CancelledError:
         print("任务被取消，清理资源中...")
     finally:
+        # 关闭进程级视觉管线单例（释放模型内存 + 关掉人脸底库 SQLite 连接）
+        try:
+            from core.utils.video.pipeline import reset_video_pipeline
+
+            reset_video_pipeline()
+        except Exception as exc:  # noqa: BLE001 - 退出路径不抛
+            logger.bind(tag=TAG).warning(f"[video] 关闭视觉管线失败: {exc}")
+
         # 停止全局GC管理器
         await gc_manager.stop()
 

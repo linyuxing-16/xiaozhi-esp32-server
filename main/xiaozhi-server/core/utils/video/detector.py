@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -96,11 +97,15 @@ class UltralyticsYoloBackend(DetectorBackend):
         self.model = YOLO(model_path)
         self.conf = conf
         self.imgsz = imgsz
+        # 管线已是进程级单例，多个会话线程会并发调同一个模型对象。
+        # ultralytics 的预测内部有可变状态，串行化保证不串结果。
+        self._lock = threading.Lock()
 
     def detect(self, image: np.ndarray) -> List[Detection]:
-        results = self.model.predict(
-            image, imgsz=self.imgsz, conf=self.conf, classes=[PERSON_CLASS_ID], verbose=False
-        )
+        with self._lock:
+            results = self.model.predict(
+                image, imgsz=self.imgsz, conf=self.conf, classes=[PERSON_CLASS_ID], verbose=False
+            )
         detections: List[Detection] = []
         for result in results:
             boxes = getattr(result, "boxes", None)
@@ -137,6 +142,8 @@ class OnnxYoloBackend(DetectorBackend):
         self.input_name = self.session.get_inputs()[0].name
         self.conf = conf
         self.imgsz = imgsz
+        # 同上：单例共享后需要串行化对同一 session 的推理调用
+        self._lock = threading.Lock()
 
     def _preprocess(self, image: np.ndarray) -> Tuple[np.ndarray, float, Tuple[int, int]]:
         h, w = image.shape[:2]
@@ -152,7 +159,8 @@ class OnnxYoloBackend(DetectorBackend):
 
     def detect(self, image: np.ndarray) -> List[Detection]:
         blob, scale, _ = self._preprocess(image)
-        outputs = self.session.run(None, {self.input_name: blob})
+        with self._lock:
+            outputs = self.session.run(None, {self.input_name: blob})
         if not outputs:
             return []
         prediction = np.squeeze(outputs[0])

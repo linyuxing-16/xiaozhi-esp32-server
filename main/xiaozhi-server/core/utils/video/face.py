@@ -175,7 +175,9 @@ class FaceRecognizer:
         self.det_size = int(config.get("det_size", 320))
         self.app = None
         self.database: Optional[FaceDatabase] = None
-        self._cache: Dict[int, Optional[str]] = {}
+        # 管线是进程级单例，多会话共用一个 FaceAnalysis 实例；
+        # 串行化 app.get() 保证推理不串结果。
+        self._lock = threading.Lock()
         if not self.enabled:
             logger.bind(tag=TAG).warning(
                 "[video] 未安装 insightface：人脸识别关闭，结构化输出不含 face_id"
@@ -203,7 +205,8 @@ class FaceRecognizer:
         if not self.enabled or self.app is None:
             return []
         try:
-            faces = self.app.get(image)
+            with self._lock:
+                faces = self.app.get(image)
         except Exception as exc:  # noqa: BLE001
             logger.bind(tag=TAG).debug(f"[video] 人脸检测失败: {exc}")
             return []

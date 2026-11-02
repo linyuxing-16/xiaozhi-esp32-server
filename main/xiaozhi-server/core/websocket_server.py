@@ -54,6 +54,8 @@ class WebSocketServer:
             "Memory" in self.config["selected_module"],
             "Intent" in self.config["selected_module"],
         )
+        # 调试辅助：登记活跃连接（供 /debug/video_frames 读取缓冲帧）
+        self.active_handlers = []
         self._vad = modules["vad"] if "vad" in modules else None
         self._asr = modules["asr"] if "asr" in modules else None
         self._llm = modules["llm"] if "llm" in modules else None
@@ -127,11 +129,16 @@ class WebSocketServer:
             self._intent,
             self,  # 传入server实例
         )
+        self.active_handlers.append(handler)
         try:
             await handler.handle_connection(websocket)
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"处理连接时出错: {e}")
         finally:
+            try:
+                self.active_handlers.remove(handler)
+            except ValueError:
+                pass
             # 强制关闭连接（如果还没有关闭的话）
             try:
                 # 安全地检查WebSocket状态并关闭

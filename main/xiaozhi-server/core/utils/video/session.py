@@ -55,34 +55,52 @@ class RoundArtifacts:
     user_analysis: Optional[dict] = None
     tts_video: Optional[str] = None
     tts_analysis: Optional[dict] = None
+    # 短视频兜底：片段时长 < video.image_fallback_max_ms 时不发 mp4（上游网关会
+    # 以 code 11133 拒绝），改为每 0.1s 抽一帧，以图片内容块发送。
+    user_images: List[str] = field(default_factory=list)
+    tts_images: List[str] = field(default_factory=list)
     asr: Optional[dict] = None
     notes: List[str] = field(default_factory=list)
 
     @property
     def has_video(self) -> bool:
-        return bool(self.user_video or self.tts_video)
+        """是否带有多模态内容（视频或图片）。"""
+        return bool(
+            self.user_video
+            or self.tts_video
+            or self.user_images
+            or self.tts_images
+        )
+
+    @staticmethod
+    def media_attachments(
+        kind: str, video: Optional[str], images: Sequence[str], analysis: Optional[dict]
+    ) -> List[dict]:
+        """一段（④ 或 ⑤）的附件：有图片就发图片，否则发视频。"""
+        if images:
+            return [
+                {"type": "image", "kind": kind, "path": path, "analysis": analysis}
+                for path in images
+            ]
+        if video:
+            return [
+                {"type": "video", "kind": kind, "path": video, "analysis": analysis}
+            ]
+        return []
 
     def attachments(self) -> List[dict]:
         """组装成 Message.attachments（⑤ 在前、④ 在后，与消息列表顺序一致）。"""
         result: List[dict] = []
-        if self.tts_video:
-            result.append(
-                {
-                    "type": "video",
-                    "kind": "tts",
-                    "path": self.tts_video,
-                    "analysis": self.tts_analysis,
-                }
+        result.extend(
+            self.media_attachments(
+                "tts", self.tts_video, self.tts_images, self.tts_analysis
             )
-        if self.user_video:
-            result.append(
-                {
-                    "type": "video",
-                    "kind": "user",
-                    "path": self.user_video,
-                    "analysis": self.user_analysis,
-                }
+        )
+        result.extend(
+            self.media_attachments(
+                "user", self.user_video, self.user_images, self.user_analysis
             )
+        )
         return result
 
 
@@ -108,6 +126,15 @@ class VideoSession:
         self.analyze = bool(video_config.get("analyze", True))
         # 单段最长时长（毫秒）：超过后自动切段（事前约束，不做发送时体积拦截）
         self.max_segment_ms = max(1000, int(video_config.get("max_segment_ms", 60000)))
+        # 短视频兜底：实测上游网关（minimax-m3）对 <0.6s 的 mp4 会回 400
+        # （code 11133，参数被拒），10fps 下 5 帧/0.5s 必失败、6 帧/0.6s 通过。
+        # 因此时长低于阈值时不再发 mp4，改为每 interval 毫秒抽一帧发图片。
+        self.image_fallback_max_ms = max(
+            0, int(video_config.get("image_fallback_max_ms", 500))
+        )
+        self.image_fallback_interval_ms = max(
+            1, int(video_config.get("image_fallback_interval_ms", 100))
+        )
 
         self._frames = FrameBuffer(self.max_frames)
         self._pcm: List[PcmFrame] = []
@@ -259,25 +286,29 @@ class VideoSession:
                 )
 
         if user_span is not None and frames:
-            artifacts.user_video, artifacts.user_analysis = self._render_and_analyze(
+            (
+                artifacts.user_video,
+                artifacts.user_images,
+                artifacts.user_analysis,
+            ) = self._render_and_analyze(
                 "user", user_span, frames, pcm_frames, segments, artifacts
             )
-            if artifacts.user_video:
-                self.store.register(
-                    artifacts.user_video, self.session_id, self.round_index, "user"
-                )
+            self._register_media(
+                "user", artifacts.user_video, artifacts.user_images
+            )
         elif user_span is not None:
             artifacts.notes.append("用户说话段没有视频帧，仅保留音频与 ASR 结果")
 
         if tts_span is not None and frames:
             # ⑤ 是设备输出音频的时段：画面里没有人"在说话"，因此不传句级区间（全部标否）
-            artifacts.tts_video, artifacts.tts_analysis = self._render_and_analyze(
+            (
+                artifacts.tts_video,
+                artifacts.tts_images,
+                artifacts.tts_analysis,
+            ) = self._render_and_analyze(
                 "tts", tts_span, frames, pcm_frames, [], artifacts
             )
-            if artifacts.tts_video:
-                self.store.register(
-                    artifacts.tts_video, self.session_id, self.round_index, "tts"
-                )
+            self._register_media("tts", artifacts.tts_video, artifacts.tts_images)
 
         self.store.prune_rounds(self.session_id, self.round_index)
         return artifacts
@@ -290,17 +321,23 @@ class VideoSession:
         pcm_frames: Sequence[PcmFrame],
         segments: Sequence[SpeechSegment],
         artifacts: RoundArtifacts,
-    ) -> Tuple[Optional[str], Optional[dict]]:
+    ) -> Tuple[Optional[str], List[str], Optional[dict]]:
         start_ms, end_ms = span
         window = [f for f in frames if start_ms <= f.timestamp_ms <= end_ms]
         if not window:
             # 时间窗内没有帧：退化为"区间前最近的一批帧"
             window = [f for f in frames if f.timestamp_ms <= end_ms][-int(self.fps * 5) :]
         if not window:
-            return None, None
+            return None, [], None
+
+        # 短视频兜底判定：时长低于阈值时不发 mp4（上游网关会以 code 11133 拒绝），
+        # 改为每 image_fallback_interval_ms 抽一帧发图片。
+        span_ms = max(0, int(end_ms) - int(start_ms))
+        image_mode = span_ms < self.image_fallback_max_ms
 
         analysis: Optional[dict] = None
         annotated_path: Optional[str] = None
+        annotated_frames: List[VideoFrame] = []
 
         # 需求 ②④⑤：先跑分析拿到"经过②处理的视频"（画了 person_id / face_id /
         # 是否说话的标注视频），发给 LLM 的应当是这一版，而不是未处理的原始帧。
@@ -313,6 +350,7 @@ class VideoSession:
                         segments=segments,
                         session_id=self.session_id,
                         name=f"{kind}_round{self.round_index}",
+                        mux=not image_mode,
                     )
                 if result.ok:
                     analysis = {
@@ -321,6 +359,7 @@ class VideoSession:
                         "stats": result.stats,
                     }
                     annotated_path = result.video_path
+                    annotated_frames = list(result.annotated_frames or [])
                     if annotated_path:
                         self.store.register(
                             annotated_path,
@@ -337,6 +376,17 @@ class VideoSession:
             except Exception as exc:  # noqa: BLE001
                 logger.bind(tag=TAG).error(f"[video] {kind} 视觉分析异常: {exc}")
                 artifacts.notes.append(f"{kind} 视觉分析异常: {exc}")
+
+        if image_mode:
+            # 短视频：不生成 mp4，直接按 0.1s 间隔抽帧存成 JPEG 发图片。
+            image_paths = self._export_image_frames(kind, span_ms, window, annotated_frames)
+            if image_paths:
+                return None, image_paths, analysis
+            artifacts.notes.append(
+                f"{kind} 片段时长 {span_ms}ms 低于 {self.image_fallback_max_ms}ms，"
+                f"抽帧发图片失败，退化为纯文本"
+            )
+            return None, [], analysis
 
         video_path: Optional[str] = None
         if annotated_path:
@@ -366,7 +416,91 @@ class VideoSession:
             except Exception as exc:  # noqa: BLE001
                 logger.bind(tag=TAG).error(f"[video] {kind} 录制异常: {exc}")
                 artifacts.notes.append(f"{kind} 录制异常: {exc}")
-        return video_path, analysis
+        return video_path, [], analysis
+
+    def _pick_image_indices(
+        self, stamps: Sequence[int], interval_ms: int
+    ) -> List[int]:
+        """按固定间隔挑帧：首帧必取，之后每个间隔槽位只取最先落入的那一帧。
+
+        stamps 必须是升序（同一槽位多帧时只保留第一帧，避免重复发同一时刻）。
+        """
+        if not stamps:
+            return []
+        interval_ms = max(1, int(interval_ms))
+        picked: List[int] = [0]
+        next_slot = interval_ms
+        for index in range(1, len(stamps)):
+            if stamps[index] >= next_slot:
+                picked.append(index)
+                # 跳过所有仍落在同一槽位内的帧（含重复时间戳）
+                while next_slot <= stamps[index]:
+                    next_slot += interval_ms
+        return picked
+
+    def _export_image_frames(
+        self,
+        kind: str,
+        span_ms: int,
+        window: Sequence[VideoFrame],
+        annotated_frames: Sequence[VideoFrame],
+    ) -> List[str]:
+        """短视频兜底：按 image_fallback_interval_ms 抽帧落盘为 JPEG。
+
+        优先用标注帧（与"发给模型的是 ② 处理过的那一版"口径一致），
+        分析关闭/分析失败时回退到原始帧。任何一张写盘失败都只跳过该张。
+        """
+        source = list(annotated_frames) if annotated_frames else list(window)
+        if not source:
+            return []
+
+        stamps = [int(f.timestamp_ms) for f in source]
+        order = sorted(range(len(source)), key=lambda i: stamps[i])
+        sorted_stamps = [stamps[i] for i in order]
+        picked = self._pick_image_indices(sorted_stamps, self.image_fallback_interval_ms)
+
+        try:
+            os.makedirs(self.output_dir, exist_ok=True)
+        except OSError as exc:
+            logger.bind(tag=TAG).warning(f"[video] 创建图片输出目录失败: {exc}")
+            return []
+
+        base_ms = int(source[order[0]].timestamp_ms) if order else 0
+        paths: List[str] = []
+        for slot, index in enumerate(picked):
+            frame = source[order[index]]
+            if not frame.data:
+                continue
+            # 文件名带真实时间戳，便于按时间轴核对：偏移 + 序号
+            offset_ms = max(0, int(frame.timestamp_ms) - base_ms)
+            name = (
+                f"{kind}_round{self.round_index}_{self.session_id}"
+                f"_{base_ms}_{offset_ms:04d}.jpg"
+            )
+            path = os.path.join(self.output_dir, name)
+            try:
+                with open(path, "wb") as handle:
+                    handle.write(frame.data)
+            except OSError as exc:
+                logger.bind(tag=TAG).warning(f"[video] 保存抽帧图片失败 {path}: {exc}")
+                continue
+            paths.append(path)
+
+        logger.bind(tag=TAG).info(
+            f"[video] {kind} 片段 {span_ms}ms < {self.image_fallback_max_ms}ms，"
+            f"改发图片 {len(paths)} 张（间隔 {self.image_fallback_interval_ms}ms，"
+            f"来源={'标注帧' if annotated_frames else '原始帧'}）"
+        )
+        return paths
+
+    def _register_media(
+        self, kind: str, video_path: Optional[str], image_paths: Sequence[str]
+    ) -> None:
+        """把本轮产物登记进 VideoStore，会话结束时由 D5 统一删除。"""
+        if video_path:
+            self.store.register(video_path, self.session_id, self.round_index, kind)
+        for path in image_paths or ():
+            self.store.register(path, self.session_id, self.round_index, "image")
 
     def _save_frames_json(self, analysis: dict, kind: str) -> Optional[str]:
         """把 frames[] 结构化结果落盘（内部统一 JSON）。"""

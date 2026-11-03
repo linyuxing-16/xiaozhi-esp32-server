@@ -26,40 +26,38 @@ def put_round_messages(
 
     需求 ⑤：⑤（设备输出音频段）的消息在消息列表中的索引必须小于 ④（用户说话段）。
     因此先 put ⑤，再 put ④。两条都是 user 角色，代表模型要看的画面上下文。
-    没有视频时退化为单条普通 user 消息（与改动前行为一致）。
+    没有视频（也没有短视频兜底图片）时退化为单条普通 user 消息。
     """
     if artifacts is None or not artifacts.has_video:
         dialogue.put(Message(role="user", content=query))
         return
 
-    if artifacts.tts_video:
+    # 短视频兜底时 attachments() 给的是 image 块，长视频是 video 块，这里不区分；
+    # ⑤ 必须先写入，其索引才能严格小于 ④（需求 ⑤）。
+    if artifacts.tts_video or artifacts.tts_images:
         dialogue.put(
             Message(
                 role="user",
                 content=TTS_MESSAGE_TEXT,
-                attachments=[
-                    {
-                        "type": "video",
-                        "kind": "tts",
-                        "path": artifacts.tts_video,
-                        "analysis": artifacts.tts_analysis,
-                    }
-                ],
+                attachments=artifacts.media_attachments(
+                    "tts",
+                    artifacts.tts_video,
+                    artifacts.tts_images,
+                    artifacts.tts_analysis,
+                ),
             )
         )
-    if artifacts.user_video:
+    if artifacts.user_video or artifacts.user_images:
         dialogue.put(
             Message(
                 role="user",
                 content=query,
-                attachments=[
-                    {
-                        "type": "video",
-                        "kind": "user",
-                        "path": artifacts.user_video,
-                        "analysis": artifacts.user_analysis,
-                    }
-                ],
+                attachments=artifacts.media_attachments(
+                    "user",
+                    artifacts.user_video,
+                    artifacts.user_images,
+                    artifacts.user_analysis,
+                ),
             )
         )
     else:

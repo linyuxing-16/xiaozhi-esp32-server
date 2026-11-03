@@ -1240,6 +1240,14 @@ video:
   annotate: true
   # 标注视频/帧的 JPEG 质量
   jpeg_quality: 80
+  # 短视频兜底：实测上游视频网关（minimax-m3）对过短的 mp4 会直接回 400
+  # （code 11133 参数被拒），10fps 下 5 帧/0.5s 必失败、6 帧/0.6s 可通。
+  # 因此当一段视频时长低于 image_fallback_max_ms 时，不再发 mp4，
+  # 改为按 image_fallback_interval_ms 抽帧、以图片内容块（image_url）发给模型。
+  # 设为 0 可关闭该兜底（始终发视频，短视频仍会被网关拒绝）。
+  image_fallback_max_ms: 500
+  # 短视频兜底时的抽帧间隔（毫秒）：100 = 每 0.1 秒抽一帧，最多约 5 张
+  image_fallback_interval_ms: 100
   # ⑥ + D5：视频保留轮数。0 = 整个会话保留（默认）；N = 只保留最近 N 轮引用
   retention_rounds: 0
   # 兜底清理：超过该秒数仍无活动的会话视频视为孤儿

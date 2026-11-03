@@ -22,6 +22,8 @@ TTS 首帧   ──> on_tts_start()           TTS 结束 ──> on_tts_stop()  
             Dialogue.put(⑤ 消息) -> Dialogue.put(④ 消息)   （⑤ 索引 < ④ 索引）
                     ▼
             LLM content 数组：[text, video_url(base64), text(结构化摘要)]（需求 ④ D3）
+              └─ 短视频兜底（< video.image_fallback_max_ms，默认 500ms）：
+                 不发 mp4，改发每 0.1s 抽一帧的 image_url 图片块
                     ▼
             会话 close() -> VideoStore.close_session() 删除全部视频（需求 ⑥ D5）
 ```
@@ -39,7 +41,7 @@ TTS 首帧   ──> on_tts_start()           TTS 结束 ──> on_tts_stop()  
 | `core/utils/video/annotator.py` | 逐帧画框 + person_id + face_id + 是否说话 | ② |
 | `core/utils/video/scheduler.py` | 三级差异化实时调度 + 自适应降频 | D15 |
 | `core/utils/video/pipeline.py` | 产出标注视频 + `frames[]` 结构化 JSON | ② |
-| `core/utils/video/multimodal.py` | `video_url` 内容块 + base64 分块拼接 | ④ D3 |
+| `core/utils/video/multimodal.py` | `video_url` / `image_url` 内容块 + base64 分块拼接 | ④ D3 |
 | `core/utils/video/store.py` | 视频生命周期与孤儿文件清理 | ⑥ D5 |
 | `core/utils/video/session.py` | 单连接编排（把以上接到 ConnectionHandler） | 全部 |
 | `core/utils/asr_result.py` | ASR 归一化：编号/内容/声纹id/时间[xx,xx]/time_source | ③ D13 |
@@ -186,11 +188,17 @@ python -m pytest tests/test_video_pipeline.py tests/core/utils/test_video_record
 | `tests/core/utils/test_video_store.py` | ⑥ 会话结束删除、retention_rounds、孤儿兜底 |
 | `tests/test_video_wiring.py` | 二进制帧分流、VAD/TTS 打点、hello 能力协商、关闭时零副作用 |
 | `tests/e2e/test_three_rounds.py` | 三轮验收：⑤ 索引 < ④、video_url 块、③ 结构、D5 清理、D15 预算 |
+| `tests/test_video_image_fallback.py` | 短视频兜底：抽帧间隔/去重、image_url 块、图片生命周期、长视频回归 |
 
 ## 8. 未在本机验证、需真机/真实供应商复核
 
 1. ESP32 真机连续推流 5 分钟不崩、音频链路无退化（阶段 B，C14 已约定由你执行）；
 2. 真实 YOLO / InsightFace 权重下的检出率与耗时（本机未安装 `ultralytics` / `insightface`，
    测试用假检测器/假识别器验证链路与口径，**不代表真实模型精度**）；
-3. 真实视频供应商网关对 `video_url` 内联 base64 的接受度（需 `video.provider` 填 base_url + 模型名）；
+3. ~~真实视频供应商网关对 `video_url` 内联 base64 的接受度~~ —— **已实测**（2026-11-02）：
+   minimax-m3 网关接受 `video_url` 与 `image_url`，但对**过短的 mp4 会回 400**
+   （`code 11133`，10fps 下 5 帧/0.5s 必失败、6 帧/0.6s 通过），且该坏片段会因进入
+   对话历史而让**后续每一轮都失败**。因此新增短视频兜底：`span < video.image_fallback_max_ms`
+   （默认 500ms）时不发 mp4，改为每 `image_fallback_interval_ms`（默认 100ms）抽一帧发
+   `image_url` 图片块。见 `tests/test_video_image_fallback.py`；
 4. ESP32-S3 Wi-Fi 上 640×360/320×240 JPEG@10fps 与 opus 上行共存的实际带宽。

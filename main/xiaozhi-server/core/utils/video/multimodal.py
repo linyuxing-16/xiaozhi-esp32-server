@@ -32,6 +32,16 @@ def guess_mime(path: str) -> str:
     }.get(ext, "video/mp4")
 
 
+def guess_image_mime(path: str) -> str:
+    ext = os.path.splitext(path)[1].lower()
+    return {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+    }.get(ext, "image/jpeg")
+
+
 def file_to_base64(path: str, chunk_size: int = CHUNK_SIZE) -> str:
     """分块读取并 base64 编码（避免 2 倍内存峰值）。
 
@@ -65,6 +75,21 @@ def video_data_url(path: str, mime: Optional[str] = None) -> str:
 def video_url_block(path: str, mime: Optional[str] = None) -> Dict[str, Any]:
     """构造 OpenAI 兼容网关的 video_url 内容块（D3：原样内联）。"""
     return {"type": "video_url", "video_url": {"url": video_data_url(path, mime)}}
+
+
+def image_data_url(path: str, mime: Optional[str] = None) -> str:
+    """生成本地图片的 data URL。
+
+    短视频兜底路径用：上游网关对 <0.5s 的 mp4 会 400 拒绝（code 11133），
+    但接受 image_url 图片块，因此把短视频按 0.1s 抽帧后以图片形式发送。
+    """
+    mime = mime or guess_image_mime(path)
+    return f"data:{mime};base64,{file_to_base64(path)}"
+
+
+def image_url_block(path: str, mime: Optional[str] = None) -> Dict[str, Any]:
+    """构造 OpenAI 兼容网关的 image_url 内容块。"""
+    return {"type": "image_url", "image_url": {"url": image_data_url(path, mime)}}
 
 
 def text_block(text: str) -> Dict[str, Any]:
@@ -114,7 +139,11 @@ def analysis_to_text(attachments: Sequence[dict]) -> str:
 def build_content_blocks(text: str, attachments: Sequence[dict]) -> List[Dict[str, Any]]:
     """把一条消息组装成 OpenAI 兼容的 content 数组。
 
-    顺序：文本块在前，然后按 attachments 顺序插入视频块（调用方保证 ⑤ 在 ④ 之前）。
+    顺序：文本块在前，然后按 attachments 顺序插入媒体块（调用方保证 ⑤ 在 ④ 之前）。
+    附件类型分流（attachment["type"]）：
+    - "video"：video_url 内容块 + base64 内联（D3，原样发送）；
+    - "image"：image_url 内容块（短视频兜底：<0.5s 的 mp4 会被上游 400 拒绝，
+      改为每 0.1s 抽一帧发图片）。
     """
     blocks: List[Dict[str, Any]] = []
     if text:
@@ -128,10 +157,14 @@ def build_content_blocks(text: str, attachments: Sequence[dict]) -> List[Dict[st
         if not os.path.exists(path):
             logger.bind(tag=TAG).warning(f"[video] 附件不存在，跳过: {path}")
             continue
+        kind = str(attachment.get("type") or "video").lower()
         try:
-            blocks.append(video_url_block(path))
+            if kind == "image":
+                blocks.append(image_url_block(path))
+            else:
+                blocks.append(video_url_block(path))
         except OSError as exc:
-            logger.bind(tag=TAG).error(f"[video] 读取视频附件失败 {path}: {exc}")
+            logger.bind(tag=TAG).error(f"[video] 读取附件失败 {path}: {exc}")
     summary = analysis_to_text(attachments or [])
     if summary:
         blocks.append(text_block(summary))

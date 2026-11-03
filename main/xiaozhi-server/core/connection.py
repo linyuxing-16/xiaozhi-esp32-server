@@ -1631,13 +1631,23 @@ class ConnectionHandler:
                 self.logger.bind(tag=TAG).warning(f"[video] {note}")
             if artifacts.has_video:
                 self.logger.bind(tag=TAG).info(
-                    f"[video] 第 {artifacts.round_index} 轮视频已就绪: "
-                    f"用户段={artifacts.user_video} TTS段={artifacts.tts_video}"
+                    f"[video] 第 {artifacts.round_index} 轮多模态内容已就绪: "
+                    f"用户段={self._describe_media(artifacts.user_video, artifacts.user_images)} "
+                    f"TTS段={self._describe_media(artifacts.tts_video, artifacts.tts_images)}"
                 )
             return artifacts
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"[video] 生成本轮视频失败（不影响对话）: {e}")
             return None
+
+    @staticmethod
+    def _describe_media(video_path, image_paths) -> str:
+        """日志用：把"视频 / 若干张图片"压成一行描述。"""
+        if image_paths:
+            head = image_paths[0]
+            suffix = f" 等{len(image_paths)}张" if len(image_paths) > 1 else ""
+            return f"[图片{len(image_paths)}张] {head}{suffix}"
+        return str(video_path)
 
     def _put_user_message_with_video(self, query):
         """写用户消息；有视频时拆成两条（⑤ 在前、④ 在后）。

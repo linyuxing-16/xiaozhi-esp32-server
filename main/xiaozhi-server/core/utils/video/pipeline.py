@@ -77,6 +77,9 @@ class AnalysisResult:
     frames: List[dict] = field(default_factory=list)
     stats: dict = field(default_factory=dict)
     error: Optional[str] = None
+    # 标注后的逐帧 JPEG（与 frames[] 一一对应）。短视频兜底走"抽帧发图片"时
+    # 直接复用这批标注帧，保证发给模型的是 ② 处理过的那一版；annotate=false 时为空。
+    annotated_frames: List["VideoFrame"] = field(default_factory=list)
 
     def to_json(self, indent: Optional[int] = 2) -> str:
         return json.dumps(
@@ -246,6 +249,7 @@ class VideoPipeline:
         segments: Optional[Sequence[SpeechSegment]] = None,
         session_id: str = "session",
         name: str = "annotated",
+        mux: bool = True,
     ) -> AnalysisResult:
         caps = detect_capabilities()
         if not frames:
@@ -294,7 +298,9 @@ class VideoPipeline:
 
         source = annotated if annotated else list(frames)
         video_path = None
-        if caps.ffmpeg and source:
+        # mux=False：短视频兜底走"抽帧发图片"时不需要 mp4，省掉一次 ffmpeg 编码，
+        # 直接降低本轮的首字延迟（标注帧仍通过 annotated_frames 返回）。
+        if mux and caps.ffmpeg and source:
             video_path = self._mux_video(source, session_id, name, scheduler)
             if video_path is None:
                 logger.bind(tag=TAG).warning("[video] 标注视频封装失败，仅返回结构化 JSON")
@@ -323,7 +329,13 @@ class VideoPipeline:
             stats["tracked_only_ratio"] = round(
                 (len(out_frames) - detected_frames) / float(len(out_frames)), 4
             )
-        return AnalysisResult(ok=True, video_path=video_path, frames=out_frames, stats=stats)
+        return AnalysisResult(
+            ok=True,
+            video_path=video_path,
+            frames=out_frames,
+            stats=stats,
+            annotated_frames=annotated,
+        )
 
     def _mux_video(
         self,
